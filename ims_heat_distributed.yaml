@@ -1,0 +1,588 @@
+heat_template_version: 2013-05-23
+
+description: This template deploys disributed Open IMS core in Openstack.
+
+#The default parameters for Openstack.These will be used by default if not specified.
+
+parameters:
+  image:
+    type: string
+    label: Name of Image
+    description: Image to be used for the Nodes. Ubuntu based image needs to be used.
+    default: ubuntu_cloud
+  flavor:
+    type: string
+    label: Flavor
+    description: Type of instance flavor that needs to be used 
+    default: m1.small
+  key:
+    type: string
+    label: Key name
+    description: Name of the key-pair that will be used in the instances
+    default: ims_key
+  public_network:
+    type: string
+    label: External network name or ID
+    description: The external network (for floating ip)
+    default: b78b7482-70c8-4619-8501-13c03927651e
+
+resources:
+
+#Creates a new security group for Open IMS installation and sets the rules for the group.
+ 
+  ims_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: ims_security_group
+      rules:
+        - protocol: icmp
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+        - protocol: tcp
+          port_range_min: 1
+          port_range_max: 65535
+        - protocol: udp
+          port_range_min: 1
+          port_range_max: 65535
+
+#Creates a private netwrok for the Open IMS instances.
+
+  private_network:
+    type: OS::Neutron::Net
+
+  private_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network_id: { get_resource: private_network }
+      cidr: 10.0.0.0/24
+      dns_nameservers:
+        - 192.168.178.1
+
+#Creates a router between the Puplic and Private network. Sets the gateway for the router as the Public network.
+
+  router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: { get_param: public_network }
+
+#Creates the router interface for the private subnet. All the instances i.e. IMS components are in Private network.
+
+  router-interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: router }
+      subnet_id: { get_resource: private_subnet }
+
+#--------------------------------------------------------------------------------------------------------------------------------
+
+#This section configures the DNS server for IMS.
+
+#A logical port is created and then the port is associated with the Private network.The IP and security group is also specified.
+  dns_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_network }
+      fixed_ips:
+        - ip_address: 10.0.0.5
+      security_groups:
+        - { get_resource: ims_security_group }
+
+#Creates the DNS instance inside Openstack. The scripts in user_data section configures the DNS server for Open IMS.
+
+  dns_instance:
+    type: OS::Nova::Server
+    properties:
+      name: dns
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key }
+      networks:
+        - port: { get_resource: dns_port }
+      user_data_format: RAW
+      user_data: |
+            #!/bin/bash
+
+            # install dependencies
+            cat >/etc/hosts <<EOF
+            127.0.0.1 localhost dns
+            EOF
+            apt-get update
+            apt-get install bind9 -y
+            
+            cat >/etc/resolvconf/resolv.conf.d/base <<EOF
+            nameserver 10.0.0.5
+            domain open-ims.test
+            EOF
+            cat >/etc/bind/named.conf.local <<EOF
+            zone "open-ims.test" { 
+                type master; 
+                file "/etc/bind/open-ims.dnszone"; 
+            };
+            EOF
+
+            cat >/etc/bind/open-ims.dnszone <<EOF
+            
+            \$ORIGIN open-ims.test.
+            \$TTL 1W
+            @                       1D IN SOA       localhost. root.localhost. (
+                                                    2006101001      ; serial
+                                                    3H              ; refresh
+                                                    15M             ; retry
+                                                    1W              ; expiry
+                                                    1D )            ; minimum
+
+                                    1D IN NS        ns
+            ns                      1D IN A         10.0.0.5
+
+            pcscf                   1D IN A         10.0.0.10
+            _sip.pcscf              1D SRV 0 0 4060 pcscf
+            _sip._udp.pcscf         1D SRV 0 0 4060 pcscf
+            _sip._tcp.pcscf         1D SRV 0 0 4060 pcscf
+
+
+            icscf                   1D IN A         10.0.0.30
+            _sip                    1D SRV 0 0 5060 icscf
+            _sip._udp               1D SRV 0 0 5060 icscf
+            _sip._tcp               1D SRV 0 0 5060 icscf
+
+            open-ims.test.          1D IN A         127.0.0.1
+            open-ims.test.          1D IN NAPTR 10 50 "s" "SIP+D2U"    ""      _sip._udp
+            open-ims.test.          1D IN NAPTR 20 50 "s" "SIP+D2T"    ""      _sip._tcp
+
+
+            scscf                   1D IN A         10.0.0.20
+            _sip.scscf              1D SRV 0 0 6060 scscf
+            _sip._udp.scscf         1D SRV 0 0 6060 scscf
+            _sip._tcp.scscf         1D SRV 0 0 6060 scscf
+
+            trcf                    1D IN A         127.0.0.1
+            _sip.trcf               1D SRV 0 0 3060 trcf
+            _sip._udp.trcf          1D SRV 0 0 3060 trcf
+            bgcf                    1D IN A         127.0.0.1
+            _sip.bgcf               1D SRV 0 0 7060 bgcf
+            _sip._udp.bgcf          1D SRV 0 0 7060 bgcf
+            _sip._tcp.bgcf          1D SRV 0 0 7060 bgcf
+
+
+            mgcf                    1D IN A         127.0.0.1
+            _sip.mgcf               1D SRV 0 0 8060 mgcf
+            _sip._udp.mgcf          1D SRV 0 0 8060 mgcf
+            _sip._tcp.mgcf          1D SRV 0 0 8060 mgcf
+
+
+            hss                     1D IN A         10.0.0.40
+
+            ue                      1D IN A         127.0.0.1
+
+            presence                1D IN A         127.0.0.1
+            pcrf                                    1D IN A          127.0.0.1
+            clf                                     1D IN A          127.0.0.1
+           
+            EOF
+
+            sudo service bind9 restart
+            sudo ifdown eth0
+            sudo ifup eth0
+            sudo sed -i '/nameserver 192\.168\.178\.1/i nameserver 10\.0\.0\.5' /etc/resolv.conf
+            
+            sudo cat >/etc/rc.local <<EOF
+            #!/bin/sh -e
+            sudo sed -i '/nameserver 192\.168\.178\.1/i nameserver 10\.0\.0\.5' /etc/resolv.conf
+            exit 0
+            EOF
+
+#Creates a floating IP form the Public network range to ensure access from Host.
+
+  dns_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_network }
+
+#The floating IP is being associated with the corresponding dns_port in the Private network.
+
+  dns_floating_ip_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: { get_resource: dns_floating_ip }
+      port_id: { get_resource: dns_port }
+#--------------------------------------------------------------------------------------------------------------------------------
+
+#This section configures the P-CSCF component
+
+#A logical port is created and then the port is associated with the Private network.The IP and security group is also specified.
+
+  pcscf_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_network }
+      fixed_ips:
+        - ip_address: 10.0.0.10
+
+      security_groups:
+        - { get_resource: ims_security_group }
+
+#Creates the actual P-CSCF instance inside Openstack. The scripts in user_data section configures necessary parameters of P-CSCF.
+
+  pcscf_instance:
+    type: OS::Nova::Server
+    properties:
+      name: pcscf
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key }
+      networks:
+        - port: { get_resource: pcscf_port }
+      user_data_format: RAW
+      user_data: |
+            #!/bin/bash 
+
+            # install dependencies
+            cat >/etc/hosts <<EOF
+            127.0.0.1 localhost pcscf
+            EOF
+            apt-get update
+            apt-get -y install bison ant curl libcurl4-gnutls-dev subversion flex libxml2 libxml2-dev libmysqlclient-dev make default-jdk bind9
+            echo "mysql-server-5.6 mysql-server/root_password password root" | sudo debconf-set-selections
+            echo "mysql-server-5.6 mysql-server/root_password_again password root" | sudo debconf-set-selections
+            apt-get -y install mysql-server-5.6
+            sudo mkdir -p /opt/OpenIMSCore/ser_ims
+            sudo mkdir -p /opt/OpenIMSCore/FHoSS
+            cd /opt/OpenIMSCore/
+            svn checkout https://svn.code.sf.net/p/openimscore/code/ser_ims/trunk ser_ims
+            svn checkout -r 1186 https://svn.code.sf.net/p/openimscore/code/FHoSS/trunk FHoSS
+            cd /opt/OpenIMSCore/ser_ims
+            sudo make install-libs all
+            cd /opt/OpenIMSCore/FHoSS
+            sudo sed -i '/<classpath refid="compile\.classpath" \/>/a <compilerarg line="-encoding utf-8"\/>' /opt/OpenIMSCore/FHoSS/build.xml
+            sudo ant compile deploy
+            sudo cp /opt/OpenIMSCore/ser_ims/cfg/open-ims.dnszone /etc/bind/
+
+            sudo service bind9 restart
+            cat >/etc/resolvconf/resolv.conf.d/base <<EOF
+            nameserver 10.0.0.5
+            domain open-ims.test
+            EOF
+            cd /opt/OpenIMSCore/ser_ims/cfg/
+            sudo sed -i 's/127\.0\.0\.1/10\.0\.0\.10/g' pcscf.cfg pcscf.xml
+            cd /opt/OpenIMSCore/FHoSS/deploy/
+            sudo sed -i 's/127\.0\.0\.1/10\.0\.0\.40/g' DiameterPeerHSS.xml hss.properties
+            sudo service bind9 restart
+            sudo ifdown eth0
+            sudo ifup eth0
+            sudo sed -i '/nameserver 192\.168\.178\.1/i nameserver 10\.0\.0\.5' /etc/resolv.conf
+
+            sudo cat >/etc/rc.local <<EOF
+            #!/bin/sh -e
+            sudo sed -i '/nameserver 192\.168\.178\.1/i nameserver 10\.0\.0\.5' /etc/resolv.conf
+            exit 0
+            EOF
+            cd /opt/OpenIMSCore/
+            mysql -uroot -proot < ser_ims/cfg/icscf.sql
+            mysql -uroot -proot < FHoSS/scripts/hss_db.sql
+            mysql -uroot -proot < FHoSS/scripts/userdata.sql
+            sudo cp /opt/OpenIMSCore/ser_ims/cfg/*.cfg .
+            sudo cp /opt/OpenIMSCore/ser_ims/cfg/*.xml .
+            sudo cp /opt/OpenIMSCore/ser_ims/cfg/*.sh .
+ 
+#Creates a floating IP form the Public network range for the P-CSCF instance.
+
+  pcscf_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_network }
+
+#The floating IP is being associated with the corresponding pcscf_port in the Private network.
+
+  pcscf_floating_ip_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: { get_resource: pcscf_floating_ip }
+      port_id: { get_resource: pcscf_port }
+
+#--------------------------------------------------------------------------------------------------------------------------------
+
+#This section configures the P-CSCF component
+
+#A logical port is created and then the port is associated with the Private network.The IP and security group is also specified.
+
+  scscf_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_network }
+      fixed_ips:
+        - ip_address: 10.0.0.20
+
+      security_groups:
+        - { get_resource: ims_security_group }
+
+#Creates the actual S-CSCF instance inside Openstack. The scripts in user_data section configures necessary parameters of S-CSCF.
+
+  scscf_instance:
+    type: OS::Nova::Server
+    properties:
+      name: scscf
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key }
+      networks:
+        - port: { get_resource: scscf_port }
+      user_data_format: RAW
+      user_data: |
+            #!/bin/bash 
+
+            # install dependencies
+            cat >/etc/hosts <<EOF
+            127.0.0.1 localhost scscf
+            EOF
+            apt-get update
+            apt-get -y install bison ant curl libcurl4-gnutls-dev subversion flex libxml2 libxml2-dev libmysqlclient-dev make default-jdk bind9
+            echo "mysql-server-5.6 mysql-server/root_password password root" | sudo debconf-set-selections
+            echo "mysql-server-5.6 mysql-server/root_password_again password root" | sudo debconf-set-selections
+            apt-get -y install mysql-server-5.6
+            sudo mkdir -p /opt/OpenIMSCore/ser_ims
+            sudo mkdir -p /opt/OpenIMSCore/FHoSS
+            cd /opt/OpenIMSCore/
+            svn checkout https://svn.code.sf.net/p/openimscore/code/ser_ims/trunk ser_ims
+            svn checkout -r 1186 https://svn.code.sf.net/p/openimscore/code/FHoSS/trunk FHoSS
+            cd /opt/OpenIMSCore/ser_ims
+            sudo make install-libs all
+            cd /opt/OpenIMSCore/FHoSS
+            sudo sed -i '/<classpath refid="compile\.classpath" \/>/a <compilerarg line="-encoding utf-8"\/>' /opt/OpenIMSCore/FHoSS/build.xml
+            sudo ant compile deploy
+            sudo cp /opt/OpenIMSCore/ser_ims/cfg/open-ims.dnszone /etc/bind/
+
+            sudo service bind9 restart
+            cat >/etc/resolvconf/resolv.conf.d/base <<EOF
+            nameserver 10.0.0.5
+            domain open-ims.test
+            EOF
+            cd /opt/OpenIMSCore/ser_ims/cfg/
+            sudo sed -i 's/127\.0\.0\.1/10\.0\.0\.20/g' scscf.cfg scscf.xml
+            cd /opt/OpenIMSCore/FHoSS/deploy/
+            sudo sed -i 's/127\.0\.0\.1/10\.0\.0\.40/g' DiameterPeerHSS.xml hss.properties
+            sudo service bind9 restart
+            sudo ifdown eth0
+            sudo ifup eth0
+            sudo sed -i '/nameserver 192\.168\.178\.1/i nameserver 10\.0\.0\.5' /etc/resolv.conf
+
+            sudo cat >/etc/rc.local <<EOF
+            #!/bin/sh -e
+            sudo sed -i '/nameserver 192\.168\.178\.1/i nameserver 10\.0\.0\.5' /etc/resolv.conf
+            exit 0
+            EOF
+            cd /opt/OpenIMSCore/
+            mysql -uroot -proot < ser_ims/cfg/icscf.sql
+            mysql -uroot -proot < FHoSS/scripts/hss_db.sql
+            mysql -uroot -proot < FHoSS/scripts/userdata.sql
+            sudo cp /opt/OpenIMSCore/ser_ims/cfg/*.cfg .
+            sudo cp /opt/OpenIMSCore/ser_ims/cfg/*.xml .
+            sudo cp /opt/OpenIMSCore/ser_ims/cfg/*.sh .
+
+#Creates a floating IP form the Public network range for the S-CSCF instance.
+
+  scscf_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_network }
+
+#The floating IP is being associated with the corresponding scscf_port in the Private network.
+
+  scscf_floating_ip_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: { get_resource: scscf_floating_ip }
+      port_id: { get_resource: scscf_port }
+
+#--------------------------------------------------------------------------------------------------------------------------------
+
+#This section configures the I-CSCF component
+
+#A logical port is created and then the port is associated with the Private network.The IP and security group is also specified.
+
+  icscf_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_network }
+      fixed_ips:
+        - ip_address: 10.0.0.30
+
+      security_groups:
+        - { get_resource: ims_security_group }
+
+#Creates the actual I-CSCF instance inside Openstack. The scripts in user_data section configures necessary parameters of I-CSCF.
+
+  icscf_instance:
+    type: OS::Nova::Server
+    properties:
+      name: icscf
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key }
+      networks:
+        - port: { get_resource: icscf_port }
+      user_data_format: RAW
+      user_data: |
+            #!/bin/bash 
+
+            # install dependencies
+            cat >/etc/hosts <<EOF
+            127.0.0.1 localhost icscf
+            EOF
+            apt-get update
+            apt-get -y install bison ant curl libcurl4-gnutls-dev subversion flex libxml2 libxml2-dev libmysqlclient-dev make default-jdk bind9
+            echo "mysql-server-5.6 mysql-server/root_password password root" | sudo debconf-set-selections
+            echo "mysql-server-5.6 mysql-server/root_password_again password root" | sudo debconf-set-selections
+            apt-get -y install mysql-server-5.6
+            sudo mkdir -p /opt/OpenIMSCore/ser_ims
+            sudo mkdir -p /opt/OpenIMSCore/FHoSS
+            cd /opt/OpenIMSCore/
+            svn checkout https://svn.code.sf.net/p/openimscore/code/ser_ims/trunk ser_ims
+            svn checkout -r 1186 https://svn.code.sf.net/p/openimscore/code/FHoSS/trunk FHoSS
+            cd /opt/OpenIMSCore/ser_ims
+            sudo make install-libs all
+            cd /opt/OpenIMSCore/FHoSS
+            sudo sed -i '/<classpath refid="compile\.classpath" \/>/a <compilerarg line="-encoding utf-8"\/>' /opt/OpenIMSCore/FHoSS/build.xml
+            sudo ant compile deploy
+            sudo cp /opt/OpenIMSCore/ser_ims/cfg/open-ims.dnszone /etc/bind/
+
+            sudo service bind9 restart
+            cat >/etc/resolvconf/resolv.conf.d/base <<EOF
+            nameserver 10.0.0.5
+            domain open-ims.test
+            EOF
+            cd /opt/OpenIMSCore/ser_ims/cfg/
+            sudo sed -i 's/127\.0\.0\.1/10\.0\.0\.30/g' icscf.cfg icscf.xml
+            cd /opt/OpenIMSCore/FHoSS/deploy/
+            sudo sed -i 's/127\.0\.0\.1/10\.0\.0\.40/g' DiameterPeerHSS.xml hss.properties
+            sudo service bind9 restart
+            sudo ifdown eth0
+            sudo ifup eth0
+            sudo sed -i '/nameserver 192\.168\.178\.1/i nameserver 10\.0\.0\.5' /etc/resolv.conf
+
+            sudo cat >/etc/rc.local <<EOF
+            #!/bin/sh -e
+            sudo sed -i '/nameserver 192\.168\.178\.1/i nameserver 10\.0\.0\.5' /etc/resolv.conf
+            exit 0
+            EOF
+            cd /opt/OpenIMSCore/
+            mysql -uroot -proot < ser_ims/cfg/icscf.sql
+            mysql -uroot -proot < FHoSS/scripts/hss_db.sql
+            mysql -uroot -proot < FHoSS/scripts/userdata.sql
+            sudo cp /opt/OpenIMSCore/ser_ims/cfg/*.cfg .
+            sudo cp /opt/OpenIMSCore/ser_ims/cfg/*.xml .
+            sudo cp /opt/OpenIMSCore/ser_ims/cfg/*.sh .
+
+#Creates a floating IP form the Public network range for the I-CSCF instance.
+
+  icscf_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_network }
+
+#The floating IP is being associated with the corresponding icscf_port in the Private network.
+
+  icscf_floating_ip_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: { get_resource: icscf_floating_ip }
+      port_id: { get_resource: icscf_port }
+
+#--------------------------------------------------------------------------------------------------------------------------------
+
+#This section configures the HSS component
+
+#A logical port is created and then the port is associated with the Private network.The IP and security group is also specified.
+
+  hss_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_network }
+      fixed_ips:
+        - ip_address: 10.0.0.40
+
+      security_groups:
+        - { get_resource: ims_security_group }
+
+#Creates the actual HSS instance inside Openstack. The scripts in user_data section configures necessary parameters of HSS.
+
+  hss_instance:
+    type: OS::Nova::Server
+    properties:
+      name: hss
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key }
+      networks:
+        - port: { get_resource: hss_port }
+      user_data_format: RAW
+      user_data: |
+            #!/bin/bash
+ 
+            # install dependencies
+            cat >/etc/hosts <<EOF
+            127.0.0.1 localhost hss
+            EOF
+            apt-get update
+            apt-get -y install bison ant curl libcurl4-gnutls-dev subversion flex libxml2 libxml2-dev libmysqlclient-dev make default-jdk bind9
+            echo "mysql-server-5.6 mysql-server/root_password password root" | sudo debconf-set-selections
+            echo "mysql-server-5.6 mysql-server/root_password_again password root" | sudo debconf-set-selections
+            apt-get -y install mysql-server-5.6
+            sudo mkdir -p /opt/OpenIMSCore/ser_ims
+            sudo mkdir -p /opt/OpenIMSCore/FHoSS
+            cd /opt/OpenIMSCore/
+            svn checkout https://svn.code.sf.net/p/openimscore/code/ser_ims/trunk ser_ims
+            svn checkout -r 1186 https://svn.code.sf.net/p/openimscore/code/FHoSS/trunk FHoSS
+            cd /opt/OpenIMSCore/ser_ims
+            sudo make install-libs all
+            cd /opt/OpenIMSCore/FHoSS
+            sudo sed -i '/<classpath refid="compile\.classpath" \/>/a <compilerarg line="-encoding utf-8"\/>' /opt/OpenIMSCore/FHoSS/build.xml
+            sudo ant compile deploy
+            sudo cp /opt/OpenIMSCore/ser_ims/cfg/open-ims.dnszone /etc/bind/
+
+            sudo service bind9 restart
+            cat >/etc/resolvconf/resolv.conf.d/base <<EOF
+            nameserver 10.0.0.5
+            domain open-ims.test
+            EOF
+            cd /opt/OpenIMSCore/ser_ims/cfg/
+            sudo sed -i 's/127\.0\.0\.1/10\.0\.0\.10/g' pcscf.cfg pcscf.xml
+            sudo sed -i 's/127\.0\.0\.1/10\.0\.0\.20/g' scscf.cfg scscf.xml
+            sudo sed -i 's/127\.0\.0\.1/10\.0\.0\.30/g' scscf.cfg scscf.xml
+            cd /opt/OpenIMSCore/FHoSS/deploy/
+            sudo sed -i 's/127\.0\.0\.1/10\.0\.0\.40/g' DiameterPeerHSS.xml hss.properties
+            sudo service bind9 restart
+            sudo ifdown eth0
+            sudo ifup eth0
+            sudo sed -i '/nameserver 192\.168\.178\.1/i nameserver 10\.0\.0\.5' /etc/resolv.conf
+
+            sudo cat >/etc/rc.local <<EOF
+            #!/bin/sh -e
+            sudo sed -i '/nameserver 192\.168\.178\.1/i nameserver 10\.0\.0\.5' /etc/resolv.conf
+            exit 0
+            EOF
+            cd /opt/OpenIMSCore/
+            mysql -uroot -proot < ser_ims/cfg/icscf.sql
+            mysql -uroot -proot < FHoSS/scripts/hss_db.sql
+            mysql -uroot -proot < FHoSS/scripts/userdata.sql
+            sudo cp /opt/OpenIMSCore/ser_ims/cfg/*.cfg .
+            sudo cp /opt/OpenIMSCore/ser_ims/cfg/*.xml .
+            sudo cp /opt/OpenIMSCore/ser_ims/cfg/*.sh .
+
+#Creates a floating IP form the Public network range for the HSS instance.
+
+  hss_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_network }
+
+#The floating IP is being associated with the corresponding hss_port in the Private network.
+
+  hss_floating_ip_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: { get_resource: hss_floating_ip }
+      port_id: { get_resource: hss_port }
+
+#--------------------------------------------------------------------------------------------------------------------------------
